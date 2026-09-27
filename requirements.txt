@@ -1,3 +1,5 @@
-# Only needed for the Preview player; exporting works with the standard library alone.
+# Only needed for the Preview player and MP3 mix export;
+# exporting stems works with the standard library alone.
 numpy
 sounddevice
+lameenc

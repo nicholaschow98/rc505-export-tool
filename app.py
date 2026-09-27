@@ -40,6 +40,8 @@ class ExportApp(tk.Tk):
 
         self.player = player.LoopPlayer() if player else None
         self.loaded_memory: rc505.Memory | None = None  # audio currently in the player
+        self.loaded_tracks: dict = {}
+        self.loaded_rate = 44100
         self.load_token = 0  # ignores stale loads when the user switches memories quickly
         self.devices: list[tuple[int, str]] = []
 
@@ -52,6 +54,7 @@ class ExportApp(tk.Tk):
         self.device_var = tk.StringVar()
         self.volume_var = tk.DoubleVar(value=80)
         self.track_vars = [tk.BooleanVar(value=True) for _ in range(TRACK_COUNT)]
+        self.repeats_var = tk.IntVar(value=1)
 
         self.build_ui()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -165,7 +168,17 @@ class ExportApp(tk.Tk):
         ttk.Label(controls, text="Volume").pack(side="right", padx=(0, 4))
 
         self.playhead = ttk.Progressbar(preview, mode="determinate", maximum=1000)
-        self.playhead.grid(row=2, column=0, columnspan=3, sticky="ew", padx=6, pady=(2, 6))
+        self.playhead.grid(row=2, column=0, columnspan=3, sticky="ew", padx=6, pady=2)
+
+        mp3_row = ttk.Frame(preview)
+        mp3_row.grid(row=3, column=0, columnspan=3, sticky="ew", padx=6, pady=(2, 6))
+        ttk.Label(mp3_row, text="Save the mix with the tracks ticked above, repeated").pack(side="left")
+        ttk.Spinbox(mp3_row, from_=1, to=16, width=4, textvariable=self.repeats_var, state="readonly").pack(
+            side="left", padx=4
+        )
+        ttk.Label(mp3_row, text="full loop cycle(s).").pack(side="left")
+        self.mp3_button = ttk.Button(mp3_row, text="Export mix as MP3...", command=self.export_mix, state="disabled")
+        self.mp3_button.pack(side="right")
 
         if self.player is None:
             for widget in (self.play_button, self.device_combo, self.volume_scale):
@@ -369,6 +382,9 @@ class ExportApp(tk.Tk):
     def on_audio_loaded(self, memory: rc505.Memory, tracks: dict, sample_rate: int) -> None:
         self.player.set_tracks(tracks, sample_rate)
         self.loaded_memory = memory
+        self.loaded_tracks, self.loaded_rate = tracks, sample_rate
+        if not (self.worker and self.worker.is_alive()):
+            self.mp3_button.config(state="normal")
         recorded = set(tracks)
         for number, (var, button) in enumerate(zip(self.track_vars, self.track_buttons), start=1):
             var.set(number in recorded)
@@ -398,6 +414,8 @@ class ExportApp(tk.Tk):
     def unload_preview(self) -> None:
         self.stop_playback()
         self.loaded_memory = None
+        self.loaded_tracks = {}
+        self.mp3_button.config(state="disabled")
         self.load_token += 1
         for var, button in zip(self.track_vars, self.track_buttons):
             var.set(True)
@@ -416,6 +434,63 @@ class ExportApp(tk.Tk):
         self.player.device = next((index for index, n in self.devices if n == name), None)
         if self.player.is_playing:
             self.start_playback()  # reopen on the new device
+
+    def export_mix(self) -> None:
+        memory = self.loaded_memory
+        if memory is None or not self.loaded_tracks:
+            return
+        muted = {n for n, var in enumerate(self.track_vars, start=1) if not var.get()}
+        if not set(self.loaded_tracks) - muted:
+            messagebox.showwarning("Nothing to export", "Tick at least one track to include in the mix.", parent=self)
+            return
+        included = sorted(set(self.loaded_tracks) - muted)
+        suffix = "" if not muted & set(self.loaded_tracks) else " (tracks " + "".join(map(str, included)) + ")"
+        path = filedialog.asksaveasfilename(
+            parent=self,
+            title=f"Save mix of Memory {memory.label} as MP3",
+            initialdir=self.dest_var.get() if os.path.isdir(self.dest_var.get()) else None,
+            initialfile=f"{memory.folder_name} mix{suffix}.mp3",
+            defaultextension=".mp3",
+            filetypes=[("MP3 audio", "*.mp3")],
+        )
+        if not path:
+            return
+
+        self.cancel_requested = False
+        self.set_busy(True)
+        self.progress["value"] = 0
+        self.status_var.set(f"Rendering Memory {memory.label} to MP3 ...")
+        self.worker = threading.Thread(
+            target=self.mix_worker,
+            args=(self.loaded_tracks, muted, self.loaded_rate, Path(path), self.repeats_var.get()),
+            daemon=True,
+        )
+        self.worker.start()
+
+    def mix_worker(self, tracks: dict, muted: set[int], sample_rate: int, path: Path, repeats: int) -> None:
+        try:
+            finished = player.export_mix_mp3(
+                tracks,
+                muted,
+                sample_rate,
+                path,
+                repeats=repeats,
+                progress=lambda fraction: self.events.put(("mix_progress", fraction)),
+                should_cancel=lambda: self.cancel_requested,
+            )
+            self.events.put(("mix_done", path, finished))
+        except Exception as exc:
+            self.events.put(("mix_error", exc))
+
+    def on_mix_finished(self, path: Path, finished: bool) -> None:
+        self.set_busy(False)
+        if not finished:
+            self.status_var.set("MP3 export cancelled.")
+            return
+        self.progress["value"] = 1000
+        self.status_var.set(f"Saved {path.name} ({rc505.format_size(path.stat().st_size)})")
+        if messagebox.askyesno("MP3 saved", f"Saved the mix to:\n{path}\n\nOpen the folder?", parent=self):
+            os.startfile(path.parent)
 
     # ---------- export ----------
 
@@ -484,6 +559,7 @@ class ExportApp(tk.Tk):
     def set_busy(self, busy: bool) -> None:
         self.export_button.config(state="disabled" if busy else "normal")
         self.cancel_button.config(state="normal" if busy else "disabled")
+        self.mp3_button.config(state="normal" if not busy and self.loaded_tracks else "disabled")
 
     # ---------- background events ----------
 
@@ -506,6 +582,14 @@ class ExportApp(tk.Tk):
                 self.set_busy(False)
                 self.status_var.set("Export failed.")
                 messagebox.showerror("Export failed", str(event[1]), parent=self)
+            elif kind == "mix_progress":
+                self.progress["value"] = 1000 * event[1]
+            elif kind == "mix_done":
+                self.on_mix_finished(event[1], event[2])
+            elif kind == "mix_error":
+                self.set_busy(False)
+                self.status_var.set("MP3 export failed.")
+                messagebox.showerror("MP3 export failed", str(event[1]), parent=self)
             elif kind == "loaded" and event[1] == self.load_token:
                 self.on_audio_loaded(*event[2:])
             elif kind == "load_error" and event[1] == self.load_token:

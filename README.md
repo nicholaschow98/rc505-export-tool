@@ -20,7 +20,14 @@ Double-click a memory (or select it and press **Play** / Enter) to hear all its 
 Each track loops at its own length, so a track recorded 4x longer than the others plays through while the others repeat.
 Mute tracks with the Track 1-5 boxes, set the volume, and pick the output device (the RC-505 itself may be the Windows default).
 
-Preview needs two extra packages:
+### Export the mix as MP3
+
+Once a memory is loaded in the preview, **Export mix as MP3...** saves what you hear: the ticked tracks, mixed,
+for 1-16 full loop cycles (a cycle ends when every track is back at its start together, i.e. the longest loop).
+The mix is at unity gain and is only scaled down if the summed tracks would clip; the Volume slider only affects
+listening. Files are 320 kbps.
+
+Preview and MP3 export need three extra packages:
 
 ```
 pip install -r requirements.txt

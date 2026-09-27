@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import math
 import threading
+from pathlib import Path
+from typing import Callable
 
 import numpy as np
 import sounddevice as sd
@@ -10,6 +13,8 @@ import sounddevice as sd
 import rc505
 
 CHANNELS = 2
+RENDER_CHUNK = 65536  # frames per step when rendering to a file
+HEADROOM = 0.98  # peak level after normalising a mix that would clip
 
 
 def load_track_audio(track: rc505.Track) -> tuple[np.ndarray, int]:
@@ -64,6 +69,88 @@ def mix_block(
             block += audio.take(np.arange(start, start + frames), axis=0, mode="wrap")
         new_positions[number] = (start + frames) % length
     return block, new_positions
+
+
+def cycle_frames(tracks: dict[int, np.ndarray]) -> int:
+    """Frames until every track is back at its start together.
+
+    RC-505 loops are whole multiples of each other, so this is normally the longest track.
+    Unrelated lengths could make the true cycle enormous; fall back to the longest track then.
+    """
+    lengths = [len(audio) for audio in tracks.values()]
+    if not lengths:
+        return 0
+    cycle = math.lcm(*lengths)
+    return cycle if cycle <= 16 * max(lengths) else max(lengths)
+
+
+def _render_chunks(tracks: dict[int, np.ndarray], muted: set[int], total_frames: int):
+    positions: dict[int, int] = {}
+    done = 0
+    while done < total_frames:
+        frames = min(RENDER_CHUNK, total_frames - done)
+        block, positions = mix_block(tracks, positions, muted, frames)
+        done += frames
+        yield block, done
+
+
+def export_mix_mp3(
+    tracks: dict[int, np.ndarray],
+    muted: set[int],
+    sample_rate: int,
+    path: str | Path,
+    repeats: int = 1,
+    bitrate: int = 320,
+    progress: Callable[[float], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
+) -> bool:
+    """Render the unmuted tracks, looped `repeats` full cycles, to an MP3. Returns False if cancelled.
+
+    The mix is at unity gain, scaled down only if the summed tracks would clip.
+    """
+    try:
+        import lameenc
+    except ImportError as exc:
+        raise rc505.RC505Error("MP3 export needs the lameenc package: pip install -r requirements.txt") from exc
+
+    audible = {n: a for n, a in tracks.items() if n not in muted}
+    if not audible:
+        raise rc505.RC505Error("All tracks are muted; there is nothing to export.")
+    cycle = cycle_frames(audible)
+    total = cycle * repeats
+
+    # Every cycle is identical, so one pass over a single cycle finds the peak.
+    peak = max(float(np.abs(block).max()) for block, _ in _render_chunks(audible, set(), cycle))
+    gain = HEADROOM / peak if peak > HEADROOM else 1.0
+
+    encoder = lameenc.Encoder()
+    encoder.set_bit_rate(bitrate)
+    encoder.set_in_sample_rate(sample_rate)
+    encoder.set_channels(CHANNELS)
+    encoder.set_quality(2)  # 2 = high quality, 7 = fast
+
+    path = Path(path)
+    try:
+        with path.open("wb") as f:
+            for block, done in _render_chunks(audible, set(), total):
+                if should_cancel and should_cancel():
+                    raise _Cancelled
+                pcm = np.clip(block * (gain * 32767), -32768, 32767).astype("<i2")
+                f.write(encoder.encode(pcm.tobytes()))
+                if progress:
+                    progress(done / total)
+            f.write(encoder.flush())
+    except _Cancelled:
+        path.unlink(missing_ok=True)
+        return False
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+    return True
+
+
+class _Cancelled(Exception):
+    pass
 
 
 def output_devices() -> list[tuple[int, str]]:

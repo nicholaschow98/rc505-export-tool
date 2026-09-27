@@ -141,6 +141,51 @@ class PlayerTests(unittest.TestCase):
         np.testing.assert_array_equal(block[:, 0], [1, 1, 1])
         self.assertEqual(positions, {1: 3, 2: 3})
 
+    def test_cycle_is_where_all_loops_realign(self):
+        def track(n):
+            return np.zeros((n, 2), dtype=np.float32)
+
+        self.assertEqual(player.cycle_frames({1: track(100), 2: track(400)}), 400)
+        self.assertEqual(player.cycle_frames({1: track(200), 2: track(300)}), 600)
+        # Unrelated lengths would give a huge cycle; use the longest track instead.
+        self.assertEqual(player.cycle_frames({1: track(997), 2: track(1009)}), 1009)
+
+
+@unittest.skipIf(player is None, "numpy/sounddevice not installed")
+class Mp3ExportTests(unittest.TestCase):
+    def setUp(self) -> None:
+        try:
+            import lameenc  # noqa: F401
+        except ImportError:
+            self.skipTest("lameenc not installed")
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "mix.mp3"
+        t = np.arange(44100, dtype=np.float32) / 44100
+        tone = np.sin(2 * np.pi * 440 * t)[:, None].repeat(2, axis=1).astype(np.float32)
+        self.tracks = {1: tone * 0.9, 2: tone[:22050] * 0.9}  # sums to 1.8: would clip
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_writes_mp3_of_expected_length(self):
+        seen = []
+        self.assertTrue(player.export_mix_mp3(self.tracks, set(), 44100, self.path, repeats=2, bitrate=128,
+                                              progress=seen.append))
+        data = self.path.read_bytes()
+        self.assertTrue(data[:3] == b"ID3" or (data[0] == 0xFF and data[1] & 0xE0 == 0xE0))
+        # 2 s at 128 kbps is about 32 KB.
+        self.assertAlmostEqual(len(data) / 32000, 1, delta=0.15)
+        self.assertEqual(seen[-1], 1.0)
+
+    def test_all_muted_is_an_error(self):
+        with self.assertRaises(rc505.RC505Error):
+            player.export_mix_mp3(self.tracks, {1, 2}, 44100, self.path)
+        self.assertFalse(self.path.exists())
+
+    def test_cancel_removes_partial_file(self):
+        self.assertFalse(player.export_mix_mp3(self.tracks, set(), 44100, self.path, should_cancel=lambda: True))
+        self.assertFalse(self.path.exists())
+
 
 if __name__ == "__main__":
     unittest.main()
