@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import queue
 import threading
@@ -29,8 +30,8 @@ class ExportApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("RC-505 USB Storage Export Tool")
-        self.geometry("860x740")
-        self.minsize(720, 580)
+        self.geometry("880x820")
+        self.minsize(760, 660)
 
         self.memories: list[rc505.Memory] = []
         self.checked: set[int] = set()  # memory numbers
@@ -40,8 +41,9 @@ class ExportApp(tk.Tk):
 
         self.player = player.LoopPlayer() if player else None
         self.loaded_memory: rc505.Memory | None = None  # audio currently in the player
-        self.loaded_tracks: dict = {}
-        self.loaded_rate = 44100
+        self.muted_tracks: dict[int, set[int]] = {}  # memory number -> tracks left out of preview and mixdown
+        self.track_gains: dict[int, dict[int, float]] = {}  # memory number -> {track: gain} for preview and mixdown
+        self.last_export_dir: Path | None = None
         self.load_token = 0  # ignores stale loads when the user switches memories quickly
         self.devices: list[tuple[int, str]] = []
 
@@ -54,7 +56,13 @@ class ExportApp(tk.Tk):
         self.device_var = tk.StringVar()
         self.volume_var = tk.DoubleVar(value=80)
         self.track_vars = [tk.BooleanVar(value=True) for _ in range(TRACK_COUNT)]
+        self.gain_vars = [tk.DoubleVar(value=100) for _ in range(TRACK_COUNT)]  # percent
         self.repeats_var = tk.IntVar(value=1)
+        self.export_mode_var = tk.StringVar(value="stems")  # "stems" | "mixdown" | "both"
+        self.mono_var = tk.BooleanVar(value=False)
+        self.balance_var = tk.BooleanVar(value=False)
+        self.loaded_balance: dict[int, float] = {}  # auto-balance gains of the memory in the player
+        self.mix_hint_var = tk.StringVar()
 
         self.build_ui()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -98,7 +106,7 @@ class ExportApp(tk.Tk):
             "memory": ("Memory", 70, "center"),
             "name": ("Name", 160, "w"),
             "bpm": ("BPM", 60, "center"),
-            "tracks": ("Tracks recorded", 150, "center"),
+            "tracks": ("Tracks  —  (n) muted, n* level set", 200, "center"),
             "length": ("Longest", 70, "center"),
             "size": ("Size", 80, "e"),
         }
@@ -118,14 +126,59 @@ class ExportApp(tk.Tk):
 
         self.build_preview()
 
-        dest = ttk.LabelFrame(self, text="3. Export destination")
+        dest = ttk.LabelFrame(self, text="3. Export")
         dest.pack(fill="x", **pad)
         dest.columnconfigure(1, weight=1)
-        ttk.Label(dest, text="Save in:").grid(row=0, column=0, sticky="w", padx=6, pady=4)
-        ttk.Entry(dest, textvariable=self.dest_var).grid(row=0, column=1, sticky="ew", pady=4)
-        ttk.Button(dest, text="Browse...", command=self.browse_dest).grid(row=0, column=2, padx=6)
-        ttk.Label(dest, text="Bundle folder name:").grid(row=1, column=0, sticky="w", padx=6, pady=4)
-        ttk.Entry(dest, textvariable=self.bundle_var).grid(row=1, column=1, sticky="ew", pady=4)
+
+        ttk.Label(dest, text="Export as:").grid(row=0, column=0, sticky="nw", padx=6, pady=4)
+        modes = ttk.Frame(dest)
+        modes.grid(row=0, column=1, columnspan=2, sticky="w", pady=4)
+        self.mode_buttons = {}
+        for row, (value, text) in enumerate(
+            (
+                ("stems", "Stems — one WAV per track, in a folder per memory (for your DAW)"),
+                ("mixdown", "Mixdown — one MP3 per memory with its tracks mixed (for listening/sharing)"),
+                ("both", "Both"),
+            )
+        ):
+            button = ttk.Radiobutton(
+                modes, text=text, value=value, variable=self.export_mode_var, command=self.on_export_mode_changed
+            )
+            button.grid(row=row, column=0, sticky="w")
+            self.mode_buttons[value] = button
+        cycles = ttk.Frame(modes)
+        cycles.grid(row=3, column=0, sticky="w", padx=(22, 0), pady=(2, 0))
+        ttk.Label(cycles, text="Mixdown length:").pack(side="left")
+        self.repeats_spin = ttk.Spinbox(
+            cycles, from_=1, to=16, width=4, textvariable=self.repeats_var, state="disabled"
+        )
+        self.repeats_spin.pack(side="left", padx=4)
+        ttk.Label(cycles, text="full loop cycle(s). Uses each memory's Preview mutes and levels.").pack(side="left")
+
+        options = ttk.Frame(modes)
+        options.grid(row=4, column=0, sticky="w", padx=(22, 0), pady=(2, 0))
+        self.mono_check = ttk.Checkbutton(
+            options, text="Mono", variable=self.mono_var, command=self.apply_mix_options, state="disabled"
+        )
+        self.mono_check.pack(side="left")
+        self.balance_check = ttk.Checkbutton(
+            options,
+            text="Auto-balance layers & normalize",
+            variable=self.balance_var,
+            command=self.apply_mix_options,
+            state="disabled",
+        )
+        self.balance_check.pack(side="left", padx=(12, 0))
+        ttk.Label(options, text="(the Preview plays with these too)", foreground="gray").pack(side="left", padx=(8, 0))
+        if player is None:
+            for value in ("mixdown", "both"):
+                self.mode_buttons[value].config(state="disabled")
+
+        ttk.Label(dest, text="Save in:").grid(row=1, column=0, sticky="w", padx=6, pady=4)
+        ttk.Entry(dest, textvariable=self.dest_var).grid(row=1, column=1, sticky="ew", pady=4)
+        ttk.Button(dest, text="Browse...", command=self.browse_dest).grid(row=1, column=2, padx=6)
+        ttk.Label(dest, text="Bundle folder name:").grid(row=2, column=0, sticky="w", padx=6, pady=4)
+        ttk.Entry(dest, textvariable=self.bundle_var).grid(row=2, column=1, sticky="ew", pady=4)
 
         bottom = ttk.Frame(self)
         bottom.pack(fill="x", **pad)
@@ -134,8 +187,11 @@ class ExportApp(tk.Tk):
         ttk.Label(bottom, textvariable=self.status_var).pack(side="left")
         self.export_button = ttk.Button(bottom, text="Export", command=self.start_export)
         self.export_button.pack(side="right")
+        self.export_to_button = ttk.Button(bottom, text="Export to...", command=self.export_to)
+        self.export_to_button.pack(side="right", padx=(0, 6))
         self.cancel_button = ttk.Button(bottom, text="Cancel", command=self.request_cancel, state="disabled")
-        self.cancel_button.pack(side="right", padx=6)
+        self.cancel_button.pack(side="right", padx=(0, 6))
+        ttk.Button(bottom, text="Open folder", command=self.open_export_folder).pack(side="right", padx=(0, 12))
 
     def build_preview(self) -> None:
         preview = ttk.LabelFrame(self, text="Preview")
@@ -154,31 +210,43 @@ class ExportApp(tk.Tk):
 
         controls = ttk.Frame(preview)
         controls.grid(row=1, column=0, columnspan=3, sticky="ew", padx=6, pady=2)
-        self.track_buttons = []
-        for i, var in enumerate(self.track_vars, start=1):
+        self.track_buttons, self.gain_scales, self.gain_labels = [], [], []
+        for i, (on_var, gain_var) in enumerate(zip(self.track_vars, self.gain_vars), start=1):
+            strip = ttk.Frame(controls)
+            strip.pack(side="left", padx=(0, 14))
             button = ttk.Checkbutton(
-                controls, text=f"Track {i}", variable=var, command=lambda n=i: self.on_track_toggled(n), state="disabled"
+                strip, text=f"Track {i}", variable=on_var, command=lambda n=i: self.on_track_toggled(n), state="disabled"
             )
-            button.pack(side="left", padx=(0, 10))
+            button.grid(row=0, column=0, columnspan=2, sticky="w")
+            scale = ttk.Scale(
+                strip, from_=0, to=150, variable=gain_var, length=90, state="disabled",
+                command=lambda _v, n=i: self.on_gain_changed(n),
+            )
+            scale.grid(row=1, column=0)
+            scale.bind("<Double-Button-1>", lambda _e, n=i: self.reset_gain(n))
+            label = ttk.Label(strip, text="100%", width=5, anchor="e")
+            label.grid(row=1, column=1)
             self.track_buttons.append(button)
+            self.gain_scales.append(scale)
+            self.gain_labels.append(label)
+
+        master = ttk.Frame(controls)
+        master.pack(side="right")
+        self.reset_levels_button = ttk.Button(master, text="Reset levels", command=self.reset_levels, state="disabled")
+        self.reset_levels_button.grid(row=0, column=0, columnspan=2, sticky="e")
+        ttk.Label(master, text="Listening volume").grid(row=1, column=0, padx=(0, 4))
         self.volume_scale = ttk.Scale(
-            controls, from_=0, to=100, variable=self.volume_var, command=self.on_volume_changed, length=140
+            master, from_=0, to=100, variable=self.volume_var, command=self.on_volume_changed, length=110
         )
-        self.volume_scale.pack(side="right")
-        ttk.Label(controls, text="Volume").pack(side="right", padx=(0, 4))
+        self.volume_scale.grid(row=1, column=1)
+
+        ttk.Label(preview, textvariable=self.mix_hint_var, foreground="gray").grid(
+            row=3, column=0, columnspan=3, sticky="w", padx=6, pady=(0, 6)
+        )
+        self.update_mix_hint()
 
         self.playhead = ttk.Progressbar(preview, mode="determinate", maximum=1000)
-        self.playhead.grid(row=2, column=0, columnspan=3, sticky="ew", padx=6, pady=2)
-
-        mp3_row = ttk.Frame(preview)
-        mp3_row.grid(row=3, column=0, columnspan=3, sticky="ew", padx=6, pady=(2, 6))
-        ttk.Label(mp3_row, text="Save the mix with the tracks ticked above, repeated").pack(side="left")
-        ttk.Spinbox(mp3_row, from_=1, to=16, width=4, textvariable=self.repeats_var, state="readonly").pack(
-            side="left", padx=4
-        )
-        ttk.Label(mp3_row, text="full loop cycle(s).").pack(side="left")
-        self.mp3_button = ttk.Button(mp3_row, text="Export mix as MP3...", command=self.export_mix, state="disabled")
-        self.mp3_button.pack(side="right")
+        self.playhead.grid(row=2, column=0, columnspan=3, sticky="ew", padx=6, pady=(4, 2))
 
         if self.player is None:
             for widget in (self.play_button, self.device_combo, self.volume_scale):
@@ -237,8 +305,6 @@ class ExportApp(tk.Tk):
         for memory in self.memories:
             if self.hide_empty_var.get() and not memory.tracks:
                 continue
-            recorded = {t.number for t in memory.tracks}
-            tracks = "  ".join(str(n) if n in recorded else "\u00b7" for n in range(1, TRACK_COUNT + 1))
             self.tree.insert(
                 "",
                 "end",
@@ -248,7 +314,7 @@ class ExportApp(tk.Tk):
                     memory.label,
                     memory.name,
                     f"{memory.tempo:g}" if memory.tempo and memory.tracks else "",
-                    tracks,
+                    self.tracks_cell(memory),
                     rc505.format_duration(memory.longest_duration) if memory.tracks else "",
                     rc505.format_size(memory.total_size) if memory.tracks else "empty",
                 ),
@@ -259,6 +325,23 @@ class ExportApp(tk.Tk):
             self.tree.selection_set(still_there)
         self.update_selection_label()
         self.update_preview_label()
+
+    def tracks_cell(self, memory: rc505.Memory) -> str:
+        recorded = {t.number for t in memory.tracks}
+        muted = self.muted_tracks.get(memory.number, set())
+        gains = self.track_gains.get(memory.number, {})
+        cells = []
+        for n in range(1, TRACK_COUNT + 1):
+            if n not in recorded:
+                cells.append("·")
+            else:
+                cell = str(n) + ("*" if n in gains else "")
+                cells.append(f"({cell})" if n in muted else cell)
+        return "  ".join(cells)
+
+    def refresh_tracks_cell(self, memory: rc505.Memory) -> None:
+        if self.tree.exists(str(memory.number)):
+            self.tree.set(str(memory.number), "tracks", self.tracks_cell(memory))
 
     def memory_by_number(self, number: int) -> rc505.Memory:
         return next(m for m in self.memories if m.number == number)
@@ -373,22 +456,24 @@ class ExportApp(tk.Tk):
         def load() -> None:
             try:
                 tracks, sample_rate = player.load_memory_audio(memory)
-                self.events.put(("loaded", token, memory, tracks, sample_rate))
+                balance = player.balance_gains(tracks)  # cheap, and ready if auto-balance gets switched on
+                self.events.put(("loaded", token, memory, tracks, sample_rate, balance))
             except Exception as exc:
                 self.events.put(("load_error", token, memory, exc))
 
         threading.Thread(target=load, daemon=True).start()
 
-    def on_audio_loaded(self, memory: rc505.Memory, tracks: dict, sample_rate: int) -> None:
+    def on_audio_loaded(self, memory: rc505.Memory, tracks: dict, sample_rate: int, balance: dict) -> None:
         self.player.set_tracks(tracks, sample_rate)
         self.loaded_memory = memory
-        self.loaded_tracks, self.loaded_rate = tracks, sample_rate
-        if not (self.worker and self.worker.is_alive()):
-            self.mp3_button.config(state="normal")
+        self.loaded_balance = balance
+        self.apply_mix_options()
         recorded = set(tracks)
+        muted = self.muted_tracks.get(memory.number, set())
         for number, (var, button) in enumerate(zip(self.track_vars, self.track_buttons), start=1):
-            var.set(number in recorded)
+            var.set(number in recorded and number not in muted)
             button.config(state="normal" if number in recorded else "disabled")
+        self.show_gains(memory, recorded)
         self.start_playback()
 
     def start_playback(self) -> None:
@@ -414,16 +499,70 @@ class ExportApp(tk.Tk):
     def unload_preview(self) -> None:
         self.stop_playback()
         self.loaded_memory = None
-        self.loaded_tracks = {}
-        self.mp3_button.config(state="disabled")
+        self.loaded_balance = {}
+        self.update_mix_hint()
         self.load_token += 1
         for var, button in zip(self.track_vars, self.track_buttons):
             var.set(True)
             button.config(state="disabled")
+        self.show_gains(None, set())
 
     def on_track_toggled(self, number: int) -> None:
+        muted = not self.track_vars[number - 1].get()
         if self.player:
-            self.player.set_muted(number, not self.track_vars[number - 1].get())
+            self.player.set_muted(number, muted)
+        memory = self.loaded_memory
+        if memory is None:
+            return
+        # Remember per memory, so the mixdown export leaves the same tracks out.
+        memory_muted = self.muted_tracks.setdefault(memory.number, set())
+        if muted:
+            memory_muted.add(number)
+        else:
+            memory_muted.discard(number)
+        self.refresh_tracks_cell(memory)
+
+    def on_gain_changed(self, number: int) -> None:
+        percent = round(self.gain_vars[number - 1].get())
+        self.gain_vars[number - 1].set(percent)  # snap to whole percent
+        self.gain_labels[number - 1].config(text=f"{percent}%")
+        if self.player:
+            self.player.set_gain(number, percent / 100)
+        memory = self.loaded_memory
+        if memory is None:
+            return
+        gains = self.track_gains.setdefault(memory.number, {})
+        if percent == 100:
+            gains.pop(number, None)
+        else:
+            gains[number] = percent / 100
+        if not gains:
+            del self.track_gains[memory.number]
+        self.refresh_tracks_cell(memory)
+
+    def reset_gain(self, number: int) -> str:
+        if str(self.gain_scales[number - 1]["state"]) != "disabled":
+            self.gain_vars[number - 1].set(100)
+            self.on_gain_changed(number)
+        return "break"
+
+    def reset_levels(self) -> None:
+        for number in range(1, TRACK_COUNT + 1):
+            self.reset_gain(number)
+
+    def show_gains(self, memory: rc505.Memory | None, recorded: set[int]) -> None:
+        """Load a memory's stored levels into the faders (and the player)."""
+        gains = self.track_gains.get(memory.number, {}) if memory else {}
+        for number, (var, scale, label) in enumerate(
+            zip(self.gain_vars, self.gain_scales, self.gain_labels), start=1
+        ):
+            percent = round(gains.get(number, 1.0) * 100)
+            var.set(percent)
+            label.config(text=f"{percent}%")
+            scale.config(state="normal" if number in recorded else "disabled")
+            if self.player and memory:
+                self.player.set_gain(number, percent / 100)
+        self.reset_levels_button.config(state="normal" if recorded else "disabled")
 
     def on_volume_changed(self, _value: str) -> None:
         if self.player:
@@ -435,64 +574,44 @@ class ExportApp(tk.Tk):
         if self.player.is_playing:
             self.start_playback()  # reopen on the new device
 
-    def export_mix(self) -> None:
-        memory = self.loaded_memory
-        if memory is None or not self.loaded_tracks:
-            return
-        muted = {n for n, var in enumerate(self.track_vars, start=1) if not var.get()}
-        if not set(self.loaded_tracks) - muted:
-            messagebox.showwarning("Nothing to export", "Tick at least one track to include in the mix.", parent=self)
-            return
-        included = sorted(set(self.loaded_tracks) - muted)
-        suffix = "" if not muted & set(self.loaded_tracks) else " (tracks " + "".join(map(str, included)) + ")"
-        path = filedialog.asksaveasfilename(
-            parent=self,
-            title=f"Save mix of Memory {memory.label} as MP3",
-            initialdir=self.dest_var.get() if os.path.isdir(self.dest_var.get()) else None,
-            initialfile=f"{memory.folder_name} mix{suffix}.mp3",
-            defaultextension=".mp3",
-            filetypes=[("MP3 audio", "*.mp3")],
-        )
-        if not path:
-            return
-
-        self.cancel_requested = False
-        self.set_busy(True)
-        self.progress["value"] = 0
-        self.status_var.set(f"Rendering Memory {memory.label} to MP3 ...")
-        self.worker = threading.Thread(
-            target=self.mix_worker,
-            args=(self.loaded_tracks, muted, self.loaded_rate, Path(path), self.repeats_var.get()),
-            daemon=True,
-        )
-        self.worker.start()
-
-    def mix_worker(self, tracks: dict, muted: set[int], sample_rate: int, path: Path, repeats: int) -> None:
-        try:
-            finished = player.export_mix_mp3(
-                tracks,
-                muted,
-                sample_rate,
-                path,
-                repeats=repeats,
-                progress=lambda fraction: self.events.put(("mix_progress", fraction)),
-                should_cancel=lambda: self.cancel_requested,
-            )
-            self.events.put(("mix_done", path, finished))
-        except Exception as exc:
-            self.events.put(("mix_error", exc))
-
-    def on_mix_finished(self, path: Path, finished: bool) -> None:
-        self.set_busy(False)
-        if not finished:
-            self.status_var.set("MP3 export cancelled.")
-            return
-        self.progress["value"] = 1000
-        self.status_var.set(f"Saved {path.name} ({rc505.format_size(path.stat().st_size)})")
-        if messagebox.askyesno("MP3 saved", f"Saved the mix to:\n{path}\n\nOpen the folder?", parent=self):
-            os.startfile(path.parent)
-
     # ---------- export ----------
+
+    def on_export_mode_changed(self) -> None:
+        wants_mixdown = self.mixdown_selected()
+        self.repeats_spin.config(state="readonly" if wants_mixdown else "disabled")
+        for check in (self.mono_check, self.balance_check):
+            check.config(state="normal" if wants_mixdown else "disabled")
+        self.apply_mix_options()
+
+    def mixdown_selected(self) -> bool:
+        return self.export_mode_var.get() in ("mixdown", "both")
+
+    def apply_mix_options(self) -> None:
+        """Make the preview play the way the mixdown will sound (only while a mixdown is being exported)."""
+        mixdown = self.mixdown_selected()
+        if self.player:
+            self.player.mono = mixdown and self.mono_var.get()
+            self.player.set_balance(self.loaded_balance if mixdown and self.balance_var.get() else None)
+        self.update_mix_hint()
+
+    def update_mix_hint(self) -> None:
+        mixdown = self.mixdown_selected()
+        if mixdown and self.balance_var.get() and self.loaded_memory and self.loaded_balance:
+            changes = [
+                f"T{n} {20 * math.log10(g):+.1f} dB"
+                for n, g in sorted(self.loaded_balance.items())
+                if abs(20 * math.log10(g)) >= 0.1
+            ]
+            text = "Auto-balance: " + (" · ".join(changes) if changes else "layers already even")
+            text += ". Your faders apply on top."
+        else:
+            text = (
+                "Track levels and mutes are remembered per memory and applied to its Mixdown only; "
+                "stems are never changed. Double-click a fader to reset it."
+            )
+        if mixdown and self.mono_var.get():
+            text = "Mono. " + text
+        self.mix_hint_var.set(text)
 
     def browse_dest(self) -> None:
         chosen = filedialog.askdirectory(parent=self, title="Choose where to save the export", initialdir=self.dest_var.get())
@@ -509,6 +628,18 @@ class ExportApp(tk.Tk):
         if not dest or not bundle_name:
             messagebox.showwarning("Missing destination", "Choose a destination folder and bundle name.", parent=self)
             return
+
+        mode = self.export_mode_var.get()
+        if mode in ("mixdown", "both"):
+            silent = [m.label for m in selected if not self.audible_tracks(m)]
+            if silent:
+                messagebox.showwarning(
+                    "Nothing to mix",
+                    f"Every track is muted or at 0% in memory {', '.join(silent)}.\n\n"
+                    "Preview it and bring at least one track back, or untick the memory.",
+                    parent=self,
+                )
+                return
 
         bundle_dir = Path(dest) / bundle_name
         source = Path(self.source_var.get())
@@ -527,29 +658,99 @@ class ExportApp(tk.Tk):
         self.cancel_requested = False
         self.set_busy(True)
         self.progress["value"] = 0
-        self.worker = threading.Thread(target=self.export_worker, args=(selected, bundle_dir), daemon=True)
+        # Snapshots, so changes made while exporting don't affect the running export.
+        muted = {number: set(tracks) for number, tracks in self.muted_tracks.items()}
+        gains = {number: dict(levels) for number, levels in self.track_gains.items()}
+        self.last_export_dir = bundle_dir
+        self.worker = threading.Thread(
+            target=self.export_worker,
+            args=(
+                selected, bundle_dir, mode, muted, gains, self.repeats_var.get(),
+                self.mono_var.get(), self.balance_var.get(),
+            ),
+            daemon=True,
+        )
         self.worker.start()
 
-    def export_worker(self, memories: list[rc505.Memory], bundle_dir: Path) -> None:
+    def export_to(self) -> None:
+        chosen = filedialog.askdirectory(parent=self, title="Export to...", initialdir=self.dest_var.get())
+        if chosen:
+            self.dest_var.set(chosen)
+            self.start_export()
+
+    def open_export_folder(self) -> None:
+        for folder in (self.last_export_dir, Path(self.dest_var.get().strip() or ".")):
+            if folder and folder.is_dir():
+                os.startfile(folder)
+                return
+        messagebox.showinfo("Nothing to open", "The export folder doesn't exist yet.", parent=self)
+
+    def audible_tracks(self, memory: rc505.Memory) -> set[int]:
+        muted = self.muted_tracks.get(memory.number, set())
+        gains = self.track_gains.get(memory.number, {})
+        return {t.number for t in memory.tracks if t.number not in muted and gains.get(t.number, 1.0) > 0}
+
+    def export_worker(
+        self,
+        memories: list[rc505.Memory],
+        bundle_dir: Path,
+        mode: str,
+        muted: dict[int, set[int]],
+        gains: dict[int, dict[int, float]],
+        repeats: int,
+        mono: bool,
+        balance: bool,
+    ) -> None:
+        do_stems, do_mixdowns = mode in ("stems", "both"), mode in ("mixdown", "both")
+        phases = do_stems + do_mixdowns
+        should_cancel = lambda: self.cancel_requested  # noqa: E731
+        copied, mixed = [], []
         try:
-            copied = rc505.export(
-                memories,
-                bundle_dir,
-                progress=lambda done, total, current: self.events.put(("progress", done, total, current)),
-                should_cancel=lambda: self.cancel_requested,
-            )
-            self.events.put(("done", bundle_dir, len(copied), self.cancel_requested))
+            if do_stems:
+                copied = rc505.export(
+                    memories,
+                    bundle_dir,
+                    progress=lambda done, total, current: self.events.put((
+                        "progress",
+                        (done / total if total else 1) / phases,
+                        f"Copying {Path(current).parent.name}/{Path(current).name} ..." if current else "",
+                    )),
+                    should_cancel=should_cancel,
+                )
+            if do_mixdowns and not self.cancel_requested:
+                base = 1 if do_stems else 0
+                mixed = player.export_mixdowns(
+                    memories,
+                    bundle_dir,
+                    muted,
+                    repeats=repeats,
+                    progress=lambda fraction, name: self.events.put(
+                        ("progress", (base + fraction) / phases, f"Mixing {name} ..." if name else "")
+                    ),
+                    should_cancel=should_cancel,
+                    gains_by_memory=gains,
+                    mono=mono,
+                    balance=balance,
+                )
+            self.events.put(("done", bundle_dir, len(copied), len(mixed), self.cancel_requested))
         except Exception as exc:  # report any failure (disk full, device unplugged, ...) to the GUI
             self.events.put(("error", exc))
 
-    def on_export_finished(self, bundle_dir: Path, count: int, cancelled: bool) -> None:
+    def on_export_finished(self, bundle_dir: Path, stems: int, mixdowns: int, cancelled: bool) -> None:
         self.set_busy(False)
+        parts = []
+        if stems:
+            parts.append(f"{stems} stem{'s' * (stems != 1)}")
+        if mixdowns:
+            parts.append(f"{mixdowns} mixdown{'s' * (mixdowns != 1)}")
+        summary = " and ".join(parts) or "nothing"
         if cancelled:
-            self.status_var.set(f"Export cancelled after {count} files.")
+            self.status_var.set(f"Export cancelled after {summary}.")
             return
-        self.status_var.set(f"Exported {count} stems to {bundle_dir}")
+        self.progress["value"] = 1000
+        self.status_var.set(f"Exported {summary} to {bundle_dir}")
         self.bundle_var.set(self.default_bundle_name())
-        if messagebox.askyesno("Export complete", f"Exported {count} stems to:\n{bundle_dir}\n\nOpen the folder?", parent=self):
+        if messagebox.askyesno("Export complete", f"Exported {summary} to:\n{bundle_dir}\n\nOpen the folder?", parent=self):
             os.startfile(bundle_dir)
 
     def request_cancel(self) -> None:
@@ -558,8 +759,8 @@ class ExportApp(tk.Tk):
 
     def set_busy(self, busy: bool) -> None:
         self.export_button.config(state="disabled" if busy else "normal")
+        self.export_to_button.config(state="disabled" if busy else "normal")
         self.cancel_button.config(state="normal" if busy else "disabled")
-        self.mp3_button.config(state="normal" if not busy and self.loaded_tracks else "disabled")
 
     # ---------- background events ----------
 
@@ -571,25 +772,16 @@ class ExportApp(tk.Tk):
                 break
             kind = event[0]
             if kind == "progress":
-                _, done, total, current = event
-                self.progress["value"] = 1000 * done / total if total else 1000
-                if current:
-                    self.status_var.set(f"Copying {Path(current).parent.name}/{Path(current).name} ...")
+                _, fraction, text = event
+                self.progress["value"] = 1000 * fraction
+                if text and not self.cancel_requested:
+                    self.status_var.set(text)
             elif kind == "done":
-                _, bundle_dir, count, cancelled = event
-                self.on_export_finished(bundle_dir, count, cancelled)
+                self.on_export_finished(*event[1:])
             elif kind == "error":
                 self.set_busy(False)
                 self.status_var.set("Export failed.")
                 messagebox.showerror("Export failed", str(event[1]), parent=self)
-            elif kind == "mix_progress":
-                self.progress["value"] = 1000 * event[1]
-            elif kind == "mix_done":
-                self.on_mix_finished(event[1], event[2])
-            elif kind == "mix_error":
-                self.set_busy(False)
-                self.status_var.set("MP3 export failed.")
-                messagebox.showerror("MP3 export failed", str(event[1]), parent=self)
             elif kind == "loaded" and event[1] == self.load_token:
                 self.on_audio_loaded(*event[2:])
             elif kind == "load_error" and event[1] == self.load_token:
