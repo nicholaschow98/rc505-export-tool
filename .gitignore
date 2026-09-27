@@ -1,0 +1,5 @@
+# Copy of the pedal's storage: 1.7 GB of personal recordings (and a 128 MB file over GitHub's limit)
+test_data/
+
+__pycache__/
+*.pyc
