@@ -51,7 +51,7 @@ class ExportApp(tk.Tk):
         self.dest_var = tk.StringVar(value=str(Path.home() / "Music"))
         self.bundle_var = tk.StringVar(value=self.default_bundle_name())
         self.hide_empty_var = tk.BooleanVar(value=True)
-        self.status_var = tk.StringVar(value="Select the RC-505's ROLAND folder to begin.")
+        self.status_var = tk.StringVar(value="Click Browse... to select the RC-505's ROLAND folder.")
         self.preview_var = tk.StringVar(value=PREVIEW_ERROR or "Select a memory, then press Play (or double-click it).")
         self.device_var = tk.StringVar()
         self.volume_var = tk.DoubleVar(value=80)
@@ -67,7 +67,6 @@ class ExportApp(tk.Tk):
         self.build_ui()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.after(POLL_MS, self.poll_events)
-        self.after(200, self.browse_source)
 
     # ---------- layout ----------
 

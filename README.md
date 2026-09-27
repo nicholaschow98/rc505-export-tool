@@ -8,7 +8,7 @@ A Tkinter app that pulls loop-memory stems off a BOSS RC-505 MK2 (in USB Storage
 python app.py
 ```
 
-1. On launch you're prompted for the RC-505 folder. Pick the `ROLAND` folder (e.g. `D:\ROLAND`) or the drive itself.
+1. Click **Browse...** and pick the `ROLAND` folder (e.g. `D:\ROLAND`) or the drive itself.
 2. Tick the ☐ box of each loop memory to export. Memories with no recordings are hidden by default.
 3. Choose where to save and name the bundle folder, then click **Export**.
 
