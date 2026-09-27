@@ -1,0 +1,3 @@
+# Only needed for the Preview player; exporting works with the standard library alone.
+numpy
+sounddevice

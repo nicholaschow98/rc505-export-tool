@@ -12,16 +12,25 @@ from tkinter import filedialog, messagebox, ttk
 
 import rc505
 
+try:
+    import player
+except Exception as exc:  # numpy/sounddevice missing, or no PortAudio library
+    player = None
+    PREVIEW_ERROR = f"Preview unavailable ({exc}). Run: pip install -r requirements.txt"
+else:
+    PREVIEW_ERROR = ""
+
 CHECKED, UNCHECKED = "\u2611", "\u2610"
 TRACK_COUNT = 5
+POLL_MS = 50
 
 
 class ExportApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("RC-505 USB Storage Export Tool")
-        self.geometry("820x620")
-        self.minsize(680, 480)
+        self.geometry("860x740")
+        self.minsize(720, 580)
 
         self.memories: list[rc505.Memory] = []
         self.checked: set[int] = set()  # memory numbers
@@ -29,14 +38,24 @@ class ExportApp(tk.Tk):
         self.cancel_requested = False
         self.worker: threading.Thread | None = None
 
+        self.player = player.LoopPlayer() if player else None
+        self.loaded_memory: rc505.Memory | None = None  # audio currently in the player
+        self.load_token = 0  # ignores stale loads when the user switches memories quickly
+        self.devices: list[tuple[int, str]] = []
+
         self.source_var = tk.StringVar()
         self.dest_var = tk.StringVar(value=str(Path.home() / "Music"))
         self.bundle_var = tk.StringVar(value=self.default_bundle_name())
         self.hide_empty_var = tk.BooleanVar(value=True)
         self.status_var = tk.StringVar(value="Select the RC-505's ROLAND folder to begin.")
+        self.preview_var = tk.StringVar(value=PREVIEW_ERROR or "Select a memory, then press Play (or double-click it).")
+        self.device_var = tk.StringVar()
+        self.volume_var = tk.DoubleVar(value=80)
+        self.track_vars = [tk.BooleanVar(value=True) for _ in range(TRACK_COUNT)]
 
         self.build_ui()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.after(POLL_MS, self.poll_events)
         self.after(200, self.browse_source)
 
     # ---------- layout ----------
@@ -52,7 +71,9 @@ class ExportApp(tk.Tk):
         ttk.Button(source, text="Rescan", command=self.rescan).pack(side="right", padx=(0, 6))
         ttk.Button(source, text="Browse...", command=self.browse_source).pack(side="right", padx=6)
 
-        memories = ttk.LabelFrame(self, text="2. Loop memories to export (click to tick)")
+        memories = ttk.LabelFrame(
+            self, text="2. Loop memories to export (tick \u2610 to export, double-click to preview)"
+        )
         memories.pack(fill="both", expand=True, **pad)
 
         toolbar = ttk.Frame(memories)
@@ -65,17 +86,18 @@ class ExportApp(tk.Tk):
         self.selection_label = ttk.Label(toolbar, text="")
         self.selection_label.pack(side="right")
 
-        columns = ("check", "memory", "name", "tracks", "length", "size")
+        columns = ("check", "memory", "name", "bpm", "tracks", "length", "size")
         tree_frame = ttk.Frame(memories)
         tree_frame.pack(fill="both", expand=True, padx=6, pady=6)
-        self.tree = ttk.Treeview(tree_frame, columns=columns, show="headings", selectmode="none")
+        self.tree = ttk.Treeview(tree_frame, columns=columns, show="headings", selectmode="browse")
         headings = {
             "check": ("", 36, "center"),
             "memory": ("Memory", 70, "center"),
-            "name": ("Name", 180, "w"),
-            "tracks": ("Tracks recorded", 170, "center"),
-            "length": ("Longest", 80, "center"),
-            "size": ("Size", 90, "e"),
+            "name": ("Name", 160, "w"),
+            "bpm": ("BPM", 60, "center"),
+            "tracks": ("Tracks recorded", 150, "center"),
+            "length": ("Longest", 70, "center"),
+            "size": ("Size", 80, "e"),
         }
         for col, (text, width, anchor) in headings.items():
             self.tree.heading(col, text=text)
@@ -86,7 +108,12 @@ class ExportApp(tk.Tk):
         self.tree.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
         self.tree.bind("<Button-1>", self.on_tree_click)
+        self.tree.bind("<Double-Button-1>", self.on_tree_double_click)
         self.tree.bind("<space>", self.on_tree_space)
+        self.tree.bind("<Return>", lambda _e: self.play_selected())
+        self.tree.bind("<<TreeviewSelect>>", lambda _e: self.update_preview_label())
+
+        self.build_preview()
 
         dest = ttk.LabelFrame(self, text="3. Export destination")
         dest.pack(fill="x", **pad)
@@ -106,6 +133,57 @@ class ExportApp(tk.Tk):
         self.export_button.pack(side="right")
         self.cancel_button = ttk.Button(bottom, text="Cancel", command=self.request_cancel, state="disabled")
         self.cancel_button.pack(side="right", padx=6)
+
+    def build_preview(self) -> None:
+        preview = ttk.LabelFrame(self, text="Preview")
+        preview.pack(fill="x", padx=8, pady=4)
+        preview.columnconfigure(1, weight=1)
+
+        self.play_button = ttk.Button(preview, text="\u25b6 Play", width=10, command=self.toggle_playback)
+        self.play_button.grid(row=0, column=0, padx=6, pady=(6, 2), sticky="w")
+        ttk.Label(preview, textvariable=self.preview_var).grid(row=0, column=1, sticky="w")
+        device_frame = ttk.Frame(preview)
+        device_frame.grid(row=0, column=2, padx=6, sticky="e")
+        ttk.Label(device_frame, text="Output:").pack(side="left")
+        self.device_combo = ttk.Combobox(device_frame, textvariable=self.device_var, state="readonly", width=32)
+        self.device_combo.pack(side="left", padx=(4, 0))
+        self.device_combo.bind("<<ComboboxSelected>>", self.on_device_selected)
+
+        controls = ttk.Frame(preview)
+        controls.grid(row=1, column=0, columnspan=3, sticky="ew", padx=6, pady=2)
+        self.track_buttons = []
+        for i, var in enumerate(self.track_vars, start=1):
+            button = ttk.Checkbutton(
+                controls, text=f"Track {i}", variable=var, command=lambda n=i: self.on_track_toggled(n), state="disabled"
+            )
+            button.pack(side="left", padx=(0, 10))
+            self.track_buttons.append(button)
+        self.volume_scale = ttk.Scale(
+            controls, from_=0, to=100, variable=self.volume_var, command=self.on_volume_changed, length=140
+        )
+        self.volume_scale.pack(side="right")
+        ttk.Label(controls, text="Volume").pack(side="right", padx=(0, 4))
+
+        self.playhead = ttk.Progressbar(preview, mode="determinate", maximum=1000)
+        self.playhead.grid(row=2, column=0, columnspan=3, sticky="ew", padx=6, pady=(2, 6))
+
+        if self.player is None:
+            for widget in (self.play_button, self.device_combo, self.volume_scale):
+                widget.config(state="disabled")
+            return
+        try:
+            self.devices = player.output_devices()
+        except Exception as exc:
+            self.preview_var.set(f"No audio output available: {exc}")
+            self.play_button.config(state="disabled")
+            return
+        self.device_combo["values"] = [name for _, name in self.devices]
+        default = player.default_output_device()
+        for index, name in self.devices:
+            if index == default:
+                self.device_var.set(name)
+                self.player.device = index
+                break
 
     @staticmethod
     def default_bundle_name() -> str:
@@ -128,10 +206,12 @@ class ExportApp(tk.Tk):
     def load_source(self, path: str) -> None:
         try:
             root = rc505.find_roland_root(path)
-            self.memories = rc505.scan(root)
+            memories = rc505.scan(root)
         except (rc505.RC505Error, OSError) as exc:
             messagebox.showerror("Not an RC-505 folder", str(exc), parent=self)
             return
+        self.unload_preview()
+        self.memories = memories
         self.source_var.set(str(root))
         available = {m.number for m in self.memories if m.tracks}
         self.checked &= available
@@ -139,6 +219,7 @@ class ExportApp(tk.Tk):
         self.status_var.set(f"Found {len(available)} memories with recordings out of {len(self.memories)}.")
 
     def refresh_tree(self) -> None:
+        selected = self.tree.selection()
         self.tree.delete(*self.tree.get_children())
         for memory in self.memories:
             if self.hide_empty_var.get() and not memory.tracks:
@@ -153,13 +234,21 @@ class ExportApp(tk.Tk):
                     CHECKED if memory.number in self.checked else UNCHECKED,
                     memory.label,
                     memory.name,
+                    f"{memory.tempo:g}" if memory.tempo and memory.tracks else "",
                     tracks,
                     rc505.format_duration(memory.longest_duration) if memory.tracks else "",
                     rc505.format_size(memory.total_size) if memory.tracks else "empty",
                 ),
                 tags=() if memory.tracks else ("empty",),
             )
+        still_there = [iid for iid in selected if self.tree.exists(iid)]
+        if still_there:
+            self.tree.selection_set(still_there)
         self.update_selection_label()
+        self.update_preview_label()
+
+    def memory_by_number(self, number: int) -> rc505.Memory:
+        return next(m for m in self.memories if m.number == number)
 
     # ---------- selection ----------
 
@@ -167,19 +256,34 @@ class ExportApp(tk.Tk):
         if self.tree.identify_region(event.x, event.y) != "cell":
             return None
         row = self.tree.identify_row(event.y)
-        if row:
+        if row and self.tree.identify_column(event.x) == "#1":
             self.tree.focus(row)
+            self.tree.selection_set(row)
             self.toggle(int(row))
+            return "break"
+        return None  # let the Treeview select the row as the preview target
+
+    def on_tree_double_click(self, event: tk.Event) -> str | None:
+        if self.tree.identify_region(event.x, event.y) != "cell":
+            return None
+        row = self.tree.identify_row(event.y)
+        if not row:
+            return None
+        if self.tree.identify_column(event.x) == "#1":
+            self.toggle(int(row))  # a fast second click on the box is just another tick
+        else:
+            self.tree.selection_set(row)
+            self.play_selected()
         return "break"
 
-    def on_tree_space(self, _event: tk.Event) -> None:
+    def on_tree_space(self, _event: tk.Event) -> str:
         row = self.tree.focus()
         if row:
             self.toggle(int(row))
+        return "break"
 
     def toggle(self, number: int) -> None:
-        memory = next(m for m in self.memories if m.number == number)
-        if not memory.tracks:
+        if not self.memory_by_number(number).tracks:
             return
         self.checked ^= {number}
         self.tree.set(str(number), "check", CHECKED if number in self.checked else UNCHECKED)
@@ -192,6 +296,10 @@ class ExportApp(tk.Tk):
     def selected_memories(self) -> list[rc505.Memory]:
         return [m for m in self.memories if m.number in self.checked]
 
+    def highlighted_memory(self) -> rc505.Memory | None:
+        selection = self.tree.selection()
+        return self.memory_by_number(int(selection[0])) if selection else None
+
     def update_selection_label(self) -> None:
         selected = self.selected_memories()
         stems = sum(len(m.tracks) for m in selected)
@@ -199,6 +307,115 @@ class ExportApp(tk.Tk):
         self.selection_label.config(
             text=f"{len(selected)} memories, {stems} stems, {rc505.format_size(size)}" if selected else ""
         )
+
+    # ---------- preview ----------
+
+    @staticmethod
+    def describe(memory: rc505.Memory) -> str:
+        parts = [f"Memory {memory.label}"]
+        if memory.has_custom_name:
+            parts.append(memory.name)
+        if memory.tempo:
+            parts.append(f"{memory.tempo:g} BPM")
+        parts.append(rc505.format_duration(memory.longest_duration))
+        return " \u00b7 ".join(parts)
+
+    def update_preview_label(self) -> None:
+        if self.player is None:
+            return
+        if self.player.is_playing and self.loaded_memory:
+            self.preview_var.set(f"Playing {self.describe(self.loaded_memory)}")
+            return
+        memory = self.highlighted_memory()
+        if memory and memory.tracks:
+            self.preview_var.set(f"Selected: {self.describe(memory)}")
+        elif memory:
+            self.preview_var.set(f"Memory {memory.label} is empty.")
+        else:
+            self.preview_var.set("Select a memory, then press Play (or double-click it).")
+
+    def toggle_playback(self) -> None:
+        if self.player and self.player.is_playing:
+            self.stop_playback()
+        else:
+            self.play_selected()
+
+    def play_selected(self) -> None:
+        if self.player is None or str(self.play_button["state"]) == "disabled":
+            return
+        memory = self.highlighted_memory()
+        if memory is None or not memory.tracks:
+            self.preview_var.set("Select a memory with recordings to preview.")
+            return
+        if memory is self.loaded_memory:
+            self.start_playback()
+            return
+
+        self.player.stop()
+        self.load_token += 1
+        token = self.load_token
+        self.preview_var.set(f"Loading {self.describe(memory)} ...")
+        self.play_button.config(text="\u25b6 Play")
+
+        def load() -> None:
+            try:
+                tracks, sample_rate = player.load_memory_audio(memory)
+                self.events.put(("loaded", token, memory, tracks, sample_rate))
+            except Exception as exc:
+                self.events.put(("load_error", token, memory, exc))
+
+        threading.Thread(target=load, daemon=True).start()
+
+    def on_audio_loaded(self, memory: rc505.Memory, tracks: dict, sample_rate: int) -> None:
+        self.player.set_tracks(tracks, sample_rate)
+        self.loaded_memory = memory
+        recorded = set(tracks)
+        for number, (var, button) in enumerate(zip(self.track_vars, self.track_buttons), start=1):
+            var.set(number in recorded)
+            button.config(state="normal" if number in recorded else "disabled")
+        self.start_playback()
+
+    def start_playback(self) -> None:
+        # Honour the current track toggles (they persist across Stop/Play of the same memory).
+        for number, var in enumerate(self.track_vars, start=1):
+            self.player.set_muted(number, not var.get())
+        self.player.set_volume(self.volume_var.get() / 100)
+        try:
+            self.player.play()
+        except Exception as exc:
+            self.preview_var.set(f"Couldn't open the audio output: {exc}")
+            return
+        self.play_button.config(text="\u25a0 Stop")
+        self.update_preview_label()
+
+    def stop_playback(self) -> None:
+        if self.player:
+            self.player.stop()
+        self.play_button.config(text="\u25b6 Play")
+        self.playhead["value"] = 0
+        self.update_preview_label()
+
+    def unload_preview(self) -> None:
+        self.stop_playback()
+        self.loaded_memory = None
+        self.load_token += 1
+        for var, button in zip(self.track_vars, self.track_buttons):
+            var.set(True)
+            button.config(state="disabled")
+
+    def on_track_toggled(self, number: int) -> None:
+        if self.player:
+            self.player.set_muted(number, not self.track_vars[number - 1].get())
+
+    def on_volume_changed(self, _value: str) -> None:
+        if self.player:
+            self.player.set_volume(self.volume_var.get() / 100)
+
+    def on_device_selected(self, _event: tk.Event) -> None:
+        name = self.device_var.get()
+        self.player.device = next((index for index, n in self.devices if n == name), None)
+        if self.player.is_playing:
+            self.start_playback()  # reopen on the new device
 
     # ---------- export ----------
 
@@ -237,7 +454,6 @@ class ExportApp(tk.Tk):
         self.progress["value"] = 0
         self.worker = threading.Thread(target=self.export_worker, args=(selected, bundle_dir), daemon=True)
         self.worker.start()
-        self.after(100, self.poll_events)
 
     def export_worker(self, memories: list[rc505.Memory], bundle_dir: Path) -> None:
         try:
@@ -250,31 +466,6 @@ class ExportApp(tk.Tk):
             self.events.put(("done", bundle_dir, len(copied), self.cancel_requested))
         except Exception as exc:  # report any failure (disk full, device unplugged, ...) to the GUI
             self.events.put(("error", exc))
-
-    def poll_events(self) -> None:
-        finished = False
-        while True:
-            try:
-                event = self.events.get_nowait()
-            except queue.Empty:
-                break
-            kind = event[0]
-            if kind == "progress":
-                _, done, total, current = event
-                self.progress["value"] = 1000 * done / total if total else 1000
-                if current:
-                    self.status_var.set(f"Copying {Path(current).parent.name}/{Path(current).name} ...")
-            elif kind == "done":
-                _, bundle_dir, count, cancelled = event
-                finished = True
-                self.on_export_finished(bundle_dir, count, cancelled)
-            elif kind == "error":
-                finished = True
-                self.set_busy(False)
-                self.status_var.set("Export failed.")
-                messagebox.showerror("Export failed", str(event[1]), parent=self)
-        if not finished:
-            self.after(100, self.poll_events)
 
     def on_export_finished(self, bundle_dir: Path, count: int, cancelled: bool) -> None:
         self.set_busy(False)
@@ -294,12 +485,45 @@ class ExportApp(tk.Tk):
         self.export_button.config(state="disabled" if busy else "normal")
         self.cancel_button.config(state="normal" if busy else "disabled")
 
+    # ---------- background events ----------
+
+    def poll_events(self) -> None:
+        while True:
+            try:
+                event = self.events.get_nowait()
+            except queue.Empty:
+                break
+            kind = event[0]
+            if kind == "progress":
+                _, done, total, current = event
+                self.progress["value"] = 1000 * done / total if total else 1000
+                if current:
+                    self.status_var.set(f"Copying {Path(current).parent.name}/{Path(current).name} ...")
+            elif kind == "done":
+                _, bundle_dir, count, cancelled = event
+                self.on_export_finished(bundle_dir, count, cancelled)
+            elif kind == "error":
+                self.set_busy(False)
+                self.status_var.set("Export failed.")
+                messagebox.showerror("Export failed", str(event[1]), parent=self)
+            elif kind == "loaded" and event[1] == self.load_token:
+                self.on_audio_loaded(*event[2:])
+            elif kind == "load_error" and event[1] == self.load_token:
+                self.preview_var.set(f"Couldn't load Memory {event[2].label}: {event[3]}")
+
+        if self.player and self.player.is_playing:
+            position, length = self.player.position()
+            self.playhead["value"] = 1000 * position / length if length else 0
+        self.after(POLL_MS, self.poll_events)
+
     def on_close(self) -> None:
         if self.worker and self.worker.is_alive():
             if not messagebox.askyesno("Export running", "An export is in progress. Cancel it and quit?", parent=self):
                 return
             self.cancel_requested = True
             self.worker.join(timeout=5)
+        if self.player:
+            self.player.close()
         self.destroy()
 
 

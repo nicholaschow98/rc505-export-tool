@@ -12,6 +12,10 @@ Layout on the device (as mounted in USB Storage Mode):
             ...
             099_5/
             TEMP/             device scratch space, never exported
+
+Fields used from each <TRACKn> block of a MEMORY file:
+    X  loop length in sample frames (the WAV is padded past this point)
+    U  tempo x 10 (1300 = 130.0 BPM)
 """
 
 from __future__ import annotations
@@ -26,8 +30,13 @@ from typing import Callable, Iterable
 TRACK_DIR_RE = re.compile(r"^(\d{3})_(\d)$")
 NAME_BLOCK_RE = re.compile(r"<NAME>(.*?)</NAME>", re.S)
 NAME_CHAR_RE = re.compile(r"<[A-Z]>(\d+)</[A-Z]>")
+TRACK_BLOCK_RE = re.compile(r"<TRACK(\d)>(.*?)</TRACK\1>", re.S)
 COUNT_RE = re.compile(r"<count>(\d+)</count>")
 INVALID_PATH_CHARS_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+WAVE_FORMAT_PCM = 1
+WAVE_FORMAT_IEEE_FLOAT = 3
+WAVE_FORMAT_EXTENSIBLE = 0xFFFE
 
 
 @dataclass
@@ -36,6 +45,7 @@ class Track:
     path: Path
     size: int
     duration: float | None  # seconds, None if the header could not be read
+    loop_frames: int | None = None  # real loop length from the memory file
 
 
 @dataclass
@@ -43,6 +53,7 @@ class Memory:
     number: int
     name: str
     tracks: list[Track] = field(default_factory=list)
+    tempo: float | None = None
 
     @property
     def label(self) -> str:
@@ -70,6 +81,31 @@ class Memory:
         return max(durations) if durations else None
 
 
+@dataclass
+class MemoryInfo:
+    name: str = ""
+    tempo: float | None = None
+    loop_frames: dict[int, int] = field(default_factory=dict)  # track number -> frames
+
+
+@dataclass
+class WavInfo:
+    format_tag: int
+    channels: int
+    sample_rate: int
+    bits_per_sample: int
+    data_offset: int
+    data_size: int
+
+    @property
+    def frame_size(self) -> int:
+        return self.channels * self.bits_per_sample // 8
+
+    @property
+    def frames(self) -> int:
+        return self.data_size // self.frame_size if self.frame_size else 0
+
+
 class RC505Error(Exception):
     pass
 
@@ -91,50 +127,78 @@ def find_roland_root(path: str | Path) -> Path:
     )
 
 
-def read_memory_name(data_dir: Path, number: int) -> str:
-    """Read the memory name, preferring whichever A/B save slot was written most recently."""
-    best_name, best_count = "", -1
+def _field(block: str, letter: str) -> int | None:
+    match = re.search(rf"<{letter}>(-?\d+)</{letter}>", block)
+    return int(match.group(1)) if match else None
+
+
+def read_memory_info(data_dir: Path, number: int) -> MemoryInfo:
+    """Read a memory's settings, preferring whichever A/B save slot was written most recently."""
+    best, best_count = MemoryInfo(), -1
     for slot in ("A", "B"):
         file = data_dir / f"MEMORY{number:03d}{slot}.RC0"
         try:
             text = file.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        block = NAME_BLOCK_RE.search(text)
-        if not block:
-            continue
-        name = "".join(chr(int(c)) for c in NAME_CHAR_RE.findall(block.group(1)) if 32 <= int(c) < 127)
         count_match = COUNT_RE.search(text)
         count = int(count_match.group(1)) if count_match else 0
-        if count > best_count:
-            best_name, best_count = name.strip(), count
-    return best_name
+        if count <= best_count:
+            continue
+
+        info = MemoryInfo()
+        block = NAME_BLOCK_RE.search(text)
+        if block:
+            chars = (int(c) for c in NAME_CHAR_RE.findall(block.group(1)))
+            info.name = "".join(chr(c) for c in chars if 32 <= c < 127).strip()
+        for track_match in TRACK_BLOCK_RE.finditer(text):
+            track_no, track_block = int(track_match.group(1)), track_match.group(2)
+            if track_no in info.loop_frames:
+                continue  # only the memory's own TRACKn blocks, which come first
+            frames = _field(track_block, "X")
+            if frames:
+                info.loop_frames[track_no] = frames
+            tempo = _field(track_block, "U")
+            if tempo and info.tempo is None and frames:
+                info.tempo = tempo / 10
+        best, best_count = info, count
+    return best
 
 
-def wav_duration(path: Path) -> float | None:
-    """Duration from the RIFF header. The stdlib wave module can't read the RC-505's 32-bit float WAVs."""
+def wav_info(path: Path) -> WavInfo | None:
+    """Parse the RIFF header. The stdlib wave module can't read the RC-505's 32-bit float WAVs."""
     try:
         with path.open("rb") as f:
             riff, _, wave_id = struct.unpack("<4sI4s", f.read(12))
             if riff != b"RIFF" or wave_id != b"WAVE":
                 return None
-            byte_rate = None
+            fmt = None
             while True:
                 header = f.read(8)
                 if len(header) < 8:
                     return None
                 chunk_id, chunk_size = struct.unpack("<4sI", header)
                 if chunk_id == b"fmt ":
-                    fmt = f.read(chunk_size)
-                    byte_rate = struct.unpack_from("<I", fmt, 8)[0]
+                    fmt = struct.unpack_from("<HHIIHH", f.read(chunk_size))
                     if chunk_size % 2:
                         f.seek(1, 1)
                 elif chunk_id == b"data":
-                    return chunk_size / byte_rate if byte_rate else None
+                    if fmt is None:
+                        return None
+                    format_tag, channels, sample_rate, _, _, bits = fmt
+                    # Some writers claim more data than the file holds; trust the file.
+                    data_offset = f.tell()
+                    available = path.stat().st_size - data_offset
+                    return WavInfo(format_tag, channels, sample_rate, bits, data_offset, min(chunk_size, available))
                 else:
                     f.seek(chunk_size + (chunk_size % 2), 1)
     except (OSError, struct.error):
         return None
+
+
+def wav_duration(path: Path) -> float | None:
+    info = wav_info(path)
+    return info.frames / info.sample_rate if info and info.sample_rate else None
 
 
 def scan(root: str | Path) -> list[Memory]:
@@ -143,6 +207,7 @@ def scan(root: str | Path) -> list[Memory]:
     wave_dir, data_dir = root / "WAVE", root / "DATA"
 
     memories: dict[int, Memory] = {}
+    infos: dict[int, MemoryInfo] = {}
     for track_dir in sorted(wave_dir.iterdir()):
         match = TRACK_DIR_RE.match(track_dir.name)
         if not match or not track_dir.is_dir():
@@ -150,11 +215,19 @@ def scan(root: str | Path) -> list[Memory]:
         mem_no, track_no = int(match.group(1)), int(match.group(2))
         memory = memories.get(mem_no)
         if memory is None:
-            memory = memories[mem_no] = Memory(mem_no, read_memory_name(data_dir, mem_no))
+            info = infos[mem_no] = read_memory_info(data_dir, mem_no)
+            memory = memories[mem_no] = Memory(mem_no, info.name, tempo=info.tempo)
         for wav in sorted(track_dir.glob("*.[wW][aA][vV]")):
             size = wav.stat().st_size
-            if size > 0:
-                memory.tracks.append(Track(track_no, wav, size, wav_duration(wav)))
+            if size == 0:
+                continue
+            header = wav_info(wav)
+            loop_frames = infos[mem_no].loop_frames.get(track_no)
+            if header:
+                # Fall back to the whole file if the memory file has no length for this track.
+                loop_frames = min(loop_frames, header.frames) if loop_frames else header.frames
+            duration = loop_frames / header.sample_rate if header and header.sample_rate else None
+            memory.tracks.append(Track(track_no, wav, size, duration, loop_frames))
 
     return [memories[n] for n in sorted(memories)]
 
