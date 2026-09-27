@@ -3,3 +3,8 @@ test_data/
 
 __pycache__/
 *.pyc
+
+# Build pipeline (build.ps1)
+.venv/
+build/
+dist/

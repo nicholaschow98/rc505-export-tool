@@ -1,8 +1,19 @@
 # RC-505 USB Storage Export Tool
 
-A Tkinter app that pulls loop-memory stems off a BOSS RC-505 MK2 (in USB Storage Mode) and bundles them into DAW-ready folders.
+A free Windows app that pulls loop-memory stems off a BOSS RC-505 MK2 (in USB Storage Mode) and bundles them into
+DAW-ready folders. It can also preview each memory's loops and export MP3 mixdowns.
+
+## Download
+
+Get `RC505-Export-Tool-<version>.exe` from the
+[latest release](https://github.com/nicholaschow98/rc505-export-tool/releases/latest). It's a single file with
+nothing to install and runs on 64-bit Windows 10/11. The exe isn't code-signed, so Windows SmartScreen may say
+"Windows protected your PC" the first time: click **More info → Run anyway**. The release notes list the exe's
+SHA-256, which you can check with `Get-FileHash <file>` in PowerShell.
 
 ## Usage
+
+Run the exe, or from source (Python 3.10+):
 
 ```
 python app.py
@@ -12,7 +23,7 @@ python app.py
 2. Tick the ☐ box of each loop memory to export. Memories with no recordings are hidden by default.
 3. Choose where to save and name the bundle folder, then click **Export**.
 
-Requires Python 3.10+. Exporting uses only the standard library.
+From source, exporting stems uses only the standard library.
 
 ## Preview
 
@@ -88,6 +99,22 @@ Useful fields in each memory file's `<TRACKn>` block:
 
 The WAVs are 32-bit float, stereo, 44.1 kHz.
 
+## Building the .exe
+
+Double-click `build.bat`, or run `.\build.ps1` in PowerShell. It needs Python 3.10+ installed and:
+
+1. creates `.venv` with only the pinned packages in `requirements-build.txt`;
+2. runs the unit tests;
+3. builds `dist\RC505 Export Tool.exe` with PyInstaller (`rc505_export_tool.spec`): a single windowed exe
+   with no Python install needed to run it;
+4. regenerates `THIRD_PARTY_NOTICES.txt` from the licenses of what is bundled (`make_notices.py`) and copies it
+   and `LICENSE` into `dist\`;
+5. runs the built exe with `--smoke-test` to check that its bundled Tk, numpy, PortAudio and LAME work;
+6. prints the exe's size and SHA-256.
+
+Run `.\build.ps1 -Clean` after changing `requirements-build.txt` to rebuild the venv from scratch.
+Bump `__version__` in `app.py` for a new release; it sets the window title and the exe's version details.
+
 ## Tests
 
 ```
@@ -95,3 +122,9 @@ python -m unittest -v test_rc505
 ```
 
 `test_data/ROLAND` is a full copy of the pedal's storage for manual testing (point the app at `test_data`).
+
+## License
+
+This tool's code is under the [MIT License](LICENSE). The Windows exe also bundles open-source components under
+their own licenses, including the LAME MP3 encoder (LGPL) via lameenc; see
+[THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt), which ships with every release.

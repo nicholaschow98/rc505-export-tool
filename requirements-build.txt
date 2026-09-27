@@ -1,0 +1,7 @@
+# Everything needed to build the .exe, pinned so every build bundles the same versions.
+# The app itself only needs requirements.txt.
+-r requirements.txt
+numpy==2.5.3
+sounddevice==0.5.6
+lameenc==1.8.4
+pyinstaller==6.22.3

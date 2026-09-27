@@ -21,6 +21,8 @@ except Exception as exc:  # numpy/sounddevice missing, or no PortAudio library
 else:
     PREVIEW_ERROR = ""
 
+__version__ = "1.0.0"
+
 CHECKED, UNCHECKED = "\u2611", "\u2610"
 TRACK_COUNT = 5
 POLL_MS = 50
@@ -29,7 +31,7 @@ POLL_MS = 50
 class ExportApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("RC-505 USB Storage Export Tool")
+        self.title(f"RC-505 USB Storage Export Tool {__version__}")
         self.geometry("880x820")
         self.minsize(760, 660)
 
@@ -51,7 +53,7 @@ class ExportApp(tk.Tk):
         self.dest_var = tk.StringVar(value=str(Path.home() / "Music"))
         self.bundle_var = tk.StringVar(value=self.default_bundle_name())
         self.hide_empty_var = tk.BooleanVar(value=True)
-        self.status_var = tk.StringVar(value="Click Browse... to select the RC-505's ROLAND folder.")
+        self.status_var = tk.StringVar(value="Select your RC-505's ROLAND folder to start.")
         self.preview_var = tk.StringVar(value=PREVIEW_ERROR or "Select a memory, then press Play (or double-click it).")
         self.device_var = tk.StringVar()
         self.volume_var = tk.DoubleVar(value=80)
@@ -75,11 +77,13 @@ class ExportApp(tk.Tk):
 
         source = ttk.LabelFrame(self, text="1. RC-505 storage (ROLAND folder)")
         source.pack(fill="x", **pad)
-        ttk.Entry(source, textvariable=self.source_var, state="readonly").pack(
-            side="left", fill="x", expand=True, padx=6, pady=6
-        )
-        ttk.Button(source, text="Rescan", command=self.rescan).pack(side="right", padx=(0, 6))
-        ttk.Button(source, text="Browse...", command=self.browse_source).pack(side="right", padx=6)
+        source_row = ttk.Frame(source)
+        source_row.pack(fill="x", padx=6, pady=(6, 2))
+        ttk.Entry(source_row, textvariable=self.source_var, state="readonly").pack(side="left", fill="x", expand=True)
+        ttk.Button(source_row, text="Rescan", command=self.rescan).pack(side="right")
+        ttk.Button(source_row, text="Browse...", command=self.browse_source).pack(side="right", padx=6)
+        self.source_hint = ttk.Label(source, foreground="gray")
+        self.source_hint.pack(fill="x", padx=6, pady=(0, 6))
 
         memories = ttk.LabelFrame(
             self, text="2. Loop memories to export (tick \u2610 to export, double-click to preview)"
@@ -117,6 +121,14 @@ class ExportApp(tk.Tk):
         self.tree.configure(yscrollcommand=scrollbar.set)
         self.tree.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
+
+        # Shown over the empty list until there is something to list.
+        placeholder_bg = ttk.Style().lookup("Treeview", "fieldbackground") or "white"
+        self.placeholder = tk.Frame(tree_frame, bg=placeholder_bg)
+        self.placeholder_label = tk.Label(self.placeholder, bg=placeholder_bg, fg="gray25", justify="center")
+        self.placeholder_label.pack(pady=(0, 10))
+        self.placeholder_button = ttk.Button(self.placeholder, text="Browse...", command=self.browse_source)
+        self.placeholder_button.pack()
         self.tree.bind("<Button-1>", self.on_tree_click)
         self.tree.bind("<Double-Button-1>", self.on_tree_double_click)
         self.tree.bind("<space>", self.on_tree_space)
@@ -192,6 +204,8 @@ class ExportApp(tk.Tk):
         self.cancel_button.pack(side="right", padx=(0, 6))
         ttk.Button(bottom, text="Open folder", command=self.open_export_folder).pack(side="right", padx=(0, 12))
 
+        self.update_empty_state()
+
     def build_preview(self) -> None:
         preview = ttk.LabelFrame(self, text="Preview")
         preview.pack(fill="x", padx=8, pady=4)
@@ -212,13 +226,13 @@ class ExportApp(tk.Tk):
         self.track_buttons, self.gain_scales, self.gain_labels = [], [], []
         for i, (on_var, gain_var) in enumerate(zip(self.track_vars, self.gain_vars), start=1):
             strip = ttk.Frame(controls)
-            strip.pack(side="left", padx=(0, 14))
+            strip.pack(side="left", padx=(0, 8))
             button = ttk.Checkbutton(
                 strip, text=f"Track {i}", variable=on_var, command=lambda n=i: self.on_track_toggled(n), state="disabled"
             )
             button.grid(row=0, column=0, columnspan=2, sticky="w")
             scale = ttk.Scale(
-                strip, from_=0, to=150, variable=gain_var, length=90, state="disabled",
+                strip, from_=0, to=150, variable=gain_var, length=72, state="disabled",
                 command=lambda _v, n=i: self.on_gain_changed(n),
             )
             scale.grid(row=1, column=0)
@@ -235,7 +249,7 @@ class ExportApp(tk.Tk):
         self.reset_levels_button.grid(row=0, column=0, columnspan=2, sticky="e")
         ttk.Label(master, text="Listening volume").grid(row=1, column=0, padx=(0, 4))
         self.volume_scale = ttk.Scale(
-            master, from_=0, to=100, variable=self.volume_var, command=self.on_volume_changed, length=110
+            master, from_=0, to=100, variable=self.volume_var, command=self.on_volume_changed, length=100
         )
         self.volume_scale.grid(row=1, column=1)
 
@@ -324,6 +338,44 @@ class ExportApp(tk.Tk):
             self.tree.selection_set(still_there)
         self.update_selection_label()
         self.update_preview_label()
+        self.update_empty_state()
+
+    def update_empty_state(self) -> None:
+        """Guide the user until a folder is loaded, and explain an empty list."""
+        if not self.source_var.get():
+            self.source_hint.config(
+                text="Start here: connect the RC-505 in USB Storage Mode, click Browse... and select its "
+                "ROLAND folder (e.g. D:\\ROLAND). You can also pick the drive itself."
+            )
+            message = (
+                "No RC-505 folder selected yet.\n\n"
+                "Select your ROLAND folder to start:\n"
+                "connect the pedal in USB Storage Mode, then click Browse...\n"
+                "and choose the ROLAND folder (e.g. D:\\ROLAND)."
+            )
+            show_button = True
+        else:
+            self.source_hint.config(text="Use Rescan after recording or changing loops on the pedal.")
+            message = None
+            if not self.tree.get_children():
+                show_button = False
+                if self.memories:
+                    message = (
+                        "No memories with recordings in this folder.\n\n"
+                        "Untick \u201cHide empty memories\u201d to see all memory slots."
+                    )
+                else:
+                    message = "No loop memories found in this folder."
+
+        if message is None:
+            self.placeholder.place_forget()
+            return
+        self.placeholder_label.config(text=message)
+        if show_button:
+            self.placeholder_button.pack()
+        else:
+            self.placeholder_button.pack_forget()
+        self.placeholder.place(relx=0.5, rely=0.5, anchor="center")
 
     def tracks_cell(self, memory: rc505.Memory) -> str:
         recorded = {t.number for t in memory.tracks}
@@ -802,5 +854,58 @@ class ExportApp(tk.Tk):
         self.destroy()
 
 
+def smoke_test(report: Path) -> int:
+    """Exercise every bundled dependency without showing the UI; used by build.ps1 on the built exe.
+
+    A windowed exe has no console, so results go to `report`. Returns the process exit code.
+    """
+    import tempfile
+    import traceback
+
+    lines = [f"RC-505 USB Storage Export Tool {__version__}"]
+    try:
+        root = tk.Tk()  # Tcl/Tk runtime
+        root.withdraw()
+        lines.append(f"tk {root.tk.call('info', 'patchlevel')}")
+        root.destroy()
+
+        if player is None:
+            raise RuntimeError(PREVIEW_ERROR)
+        import numpy as np
+
+        lines.append(f"numpy {np.__version__}")
+        lines.append(f"audio outputs: {len(player.output_devices())}")  # PortAudio DLL
+
+        with tempfile.TemporaryDirectory() as tmp:
+            # A minimal pedal layout with one 1-second track, scanned and mixed down to MP3 (LAME).
+            track_dir = Path(tmp) / "ROLAND" / "WAVE" / "001_1"
+            track_dir.mkdir(parents=True)
+            samples = (0.5 * np.sin(np.linspace(0, 880 * np.pi, 44100))).astype("<f4").repeat(2)
+            data = samples.tobytes()
+            fmt = (3).to_bytes(2, "little") + (2).to_bytes(2, "little") + (44100).to_bytes(4, "little")
+            fmt += (44100 * 8).to_bytes(4, "little") + (8).to_bytes(2, "little") + (32).to_bytes(2, "little")
+            body = b"WAVEfmt " + len(fmt).to_bytes(4, "little") + fmt + b"data" + len(data).to_bytes(4, "little") + data
+            (track_dir / "001_1.WAV").write_bytes(b"RIFF" + len(body).to_bytes(4, "little") + body)
+
+            memories = [m for m in rc505.scan(tmp) if m.tracks]
+            written = player.export_mixdowns(memories, Path(tmp) / "out", {}, mono=True, balance=True)
+            sizes = [p.stat().st_size for p in written]
+            if len(written) != 1 or sizes[0] < 1000:
+                raise RuntimeError(f"unexpected mixdown output: {written} {sizes}")
+            lines.append(f"scan + mixdown: {written[0].name}, {sizes[0]:,} bytes")
+        lines.append("OK")
+        code = 0
+    except Exception:
+        lines.append(traceback.format_exc())
+        lines.append("FAILED")
+        code = 1
+    report.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return code
+
+
 if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) == 3 and sys.argv[1] == "--smoke-test":
+        sys.exit(smoke_test(Path(sys.argv[2])))
     ExportApp().mainloop()
